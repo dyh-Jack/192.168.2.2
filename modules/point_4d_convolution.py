@@ -124,6 +124,7 @@ class P4DConv(nn.Module):
 
         new_xyzs = []
         new_features = []
+        gt_points=[]
         for t in range(self.temporal_kernel_size//2, len(xyzs)-self.temporal_kernel_size//2, self.temporal_stride):                 # temporal anchor frames
             # spatial anchor point subsampling by FPS
             anchor_idx = pointnet2_utils.farthest_point_sample(xyzs[t], npoints//self.spatial_stride)                               # (B, N//self.spatial_stride)
@@ -136,23 +137,28 @@ class P4DConv(nn.Module):
             # print("1:",anchor_xyz_expanded.shape)
             # anchor_xyz = anchor_xyz_flipped.transpose(1, 2).contiguous()                                                            # (B, N//spatial_stride, 3)
             anchor_xyz = anchor_xyz_flipped.clone()
-            # print(anchor_xyz.shape)
-            
+            # print("anchr:",anchor_xyz.shape)
+            gt_point = []
             new_feature = []
             for i in range(t-self.temporal_kernel_size//2, t+self.temporal_kernel_size//2+1):
                 neighbor_xyz = xyzs[i]
+                # print("neighbor:",neighbor_xyz.shape)
 
                 idx = pointnet2_utils.query_ball_point(self.r, self.k, neighbor_xyz, anchor_xyz)
+                # print("idx:",idx.shape)
 
                 neighbor_xyz_flipped = neighbor_xyz.transpose(1, 2).contiguous()                                                    # (B, 3, N)
                 # print(neighbor_xyz_flipped.shape)
                 neighbor_xyz_grouped = pointnet2_utils.GroupOperation(neighbor_xyz_flipped, idx)                                # (B, 3, N//spatial_stride, k)
                 neighbor_xyz_grouped = neighbor_xyz_grouped.permute(0,3,1,2).contiguous()
                 # print(neighbor_xyz_grouped.shape)
+                neighbor_points_one_frame = neighbor_xyz_grouped.clone()
                 xyz_displacement = neighbor_xyz_grouped - anchor_xyz_expanded                                                       # (B, 3, N//spatial_stride, k)
                 t_displacement = torch.ones((xyz_displacement.size()[0], 1, xyz_displacement.size()[2], xyz_displacement.size()[3]), dtype=torch.float32, device=device) * (i-t)
                 displacement = torch.cat(tensors=(xyz_displacement, t_displacement), dim=1, out=None)                               # (B, 4, N//spatial_stride, k)
+                # print("dis:", displacement.shape)
                 displacement = self.conv_d(displacement)
+                # print("display:",displacement.shape)
                 # print("inplanes:",self.in_planes)
                 if self.in_planes != 0:
                     neighbor_feature_grouped = pointnet2_utils.GroupOperation(features[i], idx)                                 # (B, in_planes, N//spatial_stride, k)
@@ -167,6 +173,7 @@ class P4DConv(nn.Module):
                     feature = displacement
 
                 feature = self.mlp(feature)
+                # print("fea:",feature.shape)
                 if self.spatial_pooling == 'max':
                     feature = torch.max(input=feature, dim=-1, keepdim=False)[0]                                                        # (B, out_planes, n)
                 elif self.spatial_pooling == 'sum':
@@ -175,8 +182,11 @@ class P4DConv(nn.Module):
                     feature = torch.mean(input=feature, dim=-1, keepdim=False)
                 # print("feature:",feature.shape)
                 new_feature.append(feature)
+                gt_point.append(neighbor_points_one_frame)
             new_feature = torch.stack(tensors=new_feature, dim=1)
             # print("new feature:",new_feature.shape)
+            gt_point = torch.cat(tensors=gt_point,dim=-1)
+            # print("gt_point:",gt_point.shape)
             if self.temporal_pooling == 'max':
                 new_feature = torch.max(input=new_feature, dim=1, keepdim=False)[0]
             elif self.temporal_pooling == 'sum':
@@ -184,12 +194,17 @@ class P4DConv(nn.Module):
             else:
                 new_feature = torch.mean(input=new_feature, dim=1, keepdim=False)
             new_xyzs.append(anchor_xyz)
+            # print("newnewfea:",new_feature.shape)
             new_features.append(new_feature)
+            gt_points.append(gt_point)
 
         new_xyzs = torch.stack(tensors=new_xyzs, dim=1)
         new_features = torch.stack(tensors=new_features, dim=1)
+        gt_points = torch.stack(tensors=gt_points,dim=1)
+        # print("gt_points:",gt_points.shape)
+        # print("final_features:",new_features.shape)
 
-        return new_xyzs, new_features
+        return new_xyzs, new_features, gt_points
 
 # class P4DTransConv(nn.Module):
 #     def __init__(self,

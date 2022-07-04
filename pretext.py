@@ -134,25 +134,16 @@ class P4TransformerEncoder(nn.Module):
         
         ids_shuffle = torch.argsort(noise,dim=1)
         ids_restore = torch.argsort(ids_shuffle,dim=1)
-        print(ids_restore.shape)
 
         overall_mask = torch.ones([B,TN],device=features.device)
-        overall_mask[:,len_keep] = 0
-        print(len_keep)
+        overall_mask[:,:len_keep] = 0
         mask = torch.gather(overall_mask,dim=1,index=ids_restore).to(torch.bool)
-        num=0
-        for i in range(B):
-            for j in range(TN):
-                if mask[i][j]==0:
-                    num += 1
-        print("num:",num)
         return mask,ids_restore
     
 
     def forward(self, input):                                                                                                               # [B, L, N, 3]
         device = input.get_device()
-        xyzs, features = self.tube_embedding(input)                                                                                         # [B, L, n, 3], [B, L, C, n] 
-        xyz_points = input.clone()
+        xyzs, features, gt_points = self.tube_embedding(input)                                                                                         # [B, L, n, 3], [B, L, C, n] 
         xyzts = []
         xyzs = torch.split(tensor=xyzs, split_size_or_sections=1, dim=1)
         xyzs = [torch.squeeze(input=xyz, dim=1).contiguous() for xyz in xyzs]
@@ -166,8 +157,12 @@ class P4TransformerEncoder(nn.Module):
         xyzts_copy = xyzts.clone()
         
         features = features.permute(0, 1, 3, 2)                                                                                             # [B, L,   n, C]
-        print("features:",features.shape)
+        gt_points = gt_points.permute(0, 1, 3, 4, 2)
+        # print("features:",features.shape)
+        # print("change_gt_points:",gt_points.shape)
         features = torch.reshape(input=features, shape=(features.shape[0], features.shape[1]*features.shape[2], features.shape[3]))         # [B, L*n, C]
+        gt_points = torch.reshape(input=gt_points,shape=(gt_points.shape[0],gt_points.shape[1]*gt_points.shape[2],gt_points.shape[3],gt_points.shape[4]))
+        # print("gt_points:",gt_points.shape)
         B, TN, C = features.shape
         
         mask,ids_restore = self._mask_rand(features)
@@ -186,8 +181,7 @@ class P4TransformerEncoder(nn.Module):
         # output = torch.max(input=output, dim=1, keepdim=False, out=None)[0]
         # output = self.mlp_head(output)
 
-        return output, xyzts_copy, mask, ids_restore, xyz_points
-
+        return output, xyzts_copy, mask, ids_restore, gt_points
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -342,12 +336,12 @@ class P4mask(nn.Module):
             nn.Linear(128, self.transdim)
         )
         
-        # self.increase_dim = nn.Sequential(
-        #     # nn.Conv1d(self.trans_dim, 1024, 1),
-        #     # nn.BatchNorm1d(1024),
-        #     # nn.LeakyReLU(negative_slope=0.2),
-        #     nn.Conv1d(self.transdim, 3*self.group_size, 1)  #############output dimension????
-        # )
+        self.increase_dim = nn.Sequential(
+            # nn.Conv1d(self.trans_dim, 1024, 1),
+            # nn.BatchNorm1d(1024),
+            # nn.LeakyReLU(negative_slope=0.2),
+            nn.Conv1d(self.transdim, 3*96, 1)  #############output dimension????
+        )
         
         self.loss_fn = CDLoss()
         
@@ -356,22 +350,22 @@ class P4mask(nn.Module):
         trunc_normal_(self.mask_token, std=.02)
         
     def forward(self, input):
-        print("input:",input.shape)
-        visible_output, xyzts_all, mask, ids_restore, all_points = self.Encoder(input)
+        # print("input:",input.shape)
+        visible_output, xyzts_all, mask, ids_restore, gt_points = self.Encoder(input)
         B, TN, C = visible_output.shape
-        print("visible_output_encoder:",visible_output.shape)
+        # print("visible_output_encoder:",visible_output.shape)
         adjust_dimension = nn.Linear(C, self.transdim) #####调整Encoder的输出维度，与trandim相同        
         adjust_dimension = adjust_dimension.to(visible_output.device)
         visible_output = adjust_dimension(visible_output)
-        print("visible_output_adjust_dimension:",visible_output.shape)
+        # print("visible_output_adjust_dimension:",visible_output.shape)
         
         pos_emb_vis = self.decoder_pos_embed(xyzts_all[~mask]).reshape(B, -1, self.transdim) #####permute????
         pos_emb_mask = self.decoder_pos_embed(xyzts_all[mask]).reshape(B, -1, self.transdim) #####permute????
-        print("Decoder:")
-        print("pos_emb_vis:",pos_emb_vis.shape)    
-        print("pos_emb_mask:",pos_emb_mask.shape)   
+        # print("Decoder:")
+        # print("pos_emb_vis:",pos_emb_vis.shape)    
+        # print("pos_emb_mask:",pos_emb_mask.shape)   
         _, N_mask, _ = pos_emb_mask.shape
-        print("N_mask:",N_mask)
+        # print("N_mask:",N_mask)
         mask_token = self.mask_token.expand(B, N_mask ,-1)
         decoder_input = torch.cat([visible_output, mask_token],dim=1)
         decoder_pos_emb = torch.cat([pos_emb_vis, pos_emb_mask], dim=1)
@@ -379,17 +373,18 @@ class P4mask(nn.Module):
         decoder_input = torch.gather(decoder_input,dim=1,index=ids_restore.unsqueeze(-1).repeat(1,1,visible_output.shape[2]))
         decoder_pos_emb = torch.gather(decoder_pos_emb,dim=1,index=ids_restore.unsqueeze(-1).repeat(1,1,visible_output.shape[2]))
         
-        print("Dimension for decoder_input&decoder_pos_emb:",decoder_input.shape)
+        # print("Dimension for decoder_input&decoder_pos_emb:",decoder_input.shape)
         # decoder_output = self.Decoder(decoder_input, decoder_pos_emb, N_mask)
         decoder_output = self.Decoder(decoder_input, decoder_pos_emb, mask)
         
         B, M, C = decoder_output.shape
-        print("decoder_output:",decoder_output.shape)
-        all_points = torch.reshape(input=all_points,shape=(all_points.shape[0],all_points.shape[1]*all_points.shape[2],all_points.shape[3]))
-        # rebuild_points = self.increase_dim(decoder_output.transpose(1,2)).transpose(1,2).reshape(B*M, -1, 3) #####时间维度怎么办？？？？？？
-        gt_points = all_points[mask].reshape(B*M, -1, 3)
+        # print(M)
+        # print("decoder_output:",decoder_output.shape)
+        # all_points = torch.reshape(input=all_points,shape=(all_points.shape[0],all_points.shape[1]*all_points.shape[2],all_points.shape[3]))
+        rebuild_points = self.increase_dim(decoder_output.transpose(1,2)).transpose(1,2).reshape(B*M, -1, 3) #####时间维度怎么办？？？？？？
+        gt_points = gt_points[mask].reshape(B*M, -1, 3)
         print("gt_points:",gt_points.shape)
-        rebuild_points = gt_points ####Just For Debugging
+        # rebuild_points = gt_points ####Just For Debugging
         loss = self.loss_fn(rebuild_points, gt_points)
         return loss
     
@@ -407,9 +402,6 @@ class P4mask(nn.Module):
         Encoder：
         输入为[14,24,2048,3]->[B,T,N,3]
         输出为[14,12,64,1024]->[B,T//temporal_stride,N//saptial_stride,C]
-        
-        CDLoss算的不对，应该是维度出了点问题，主要问题还是在GTPOINTS
-        GT_POINTS有点问题，输出的应该是原始点云中被mask的feature对应的点，但是mask矩阵的大小是根据feature大小定的，怎么找到对应的gtpoints？
         
         pointnet2_utils里面的three_interpolate没实现
         """
